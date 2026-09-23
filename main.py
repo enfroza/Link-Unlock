@@ -93,11 +93,19 @@ async def init_db() -> None:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_prefs (
-                telegram_id       INTEGER PRIMARY KEY,
-                saved_unlock_url  TEXT
+                telegram_id     INTEGER PRIMARY KEY,
+                saved_open_url  TEXT
             )
             """
         )
+        # Migrate old column name if present
+        try:
+            await db.execute(
+                "ALTER TABLE user_prefs RENAME COLUMN saved_unlock_url TO saved_open_url"
+            )
+            await db.commit()
+        except Exception:
+            pass
         await db.commit()
     logger.info("Database ready at %s", DB_PATH)
 
@@ -142,32 +150,32 @@ async def update_link(link_id: int, telegram_id: int, field: str, value: str) ->
         return cursor.rowcount > 0
 
 
-async def get_saved_unlock_url(telegram_id: int) -> str | None:
+async def get_saved_open_url(telegram_id: int) -> str | None:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT saved_unlock_url FROM user_prefs WHERE telegram_id = ?",
+            "SELECT saved_open_url FROM user_prefs WHERE telegram_id = ?",
             (telegram_id,),
         ) as cur:
             row = await cur.fetchone()
             if row and row[0]:
                 return row[0]
-        # Fallback: most recent unlock_url from this user's links
+        # Fallback: most recent open_url from this user's links
         async with db.execute(
-            "SELECT unlock_url FROM links WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT open_url FROM links WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
             (telegram_id,),
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row and row[0] else None
 
 
-async def set_saved_unlock_url(telegram_id: int, unlock_url: str) -> None:
+async def set_saved_open_url(telegram_id: int, open_url: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO user_prefs (telegram_id, saved_unlock_url) VALUES (?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET saved_unlock_url = excluded.saved_unlock_url
+            INSERT INTO user_prefs (telegram_id, saved_open_url) VALUES (?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET saved_open_url = excluded.saved_open_url
             """,
-            (telegram_id, unlock_url),
+            (telegram_id, open_url),
         )
         await db.commit()
 
@@ -301,13 +309,64 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def start_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await send_or_edit(
-        update,
-        "🔗 <b>Step 1/2 — Open Link URL</b>\n\n"
-        "Send me the URL you want as the <b>Open Link</b> (shown to visitors as Step 1).",
-        reply_markup=cancel_keyboard(),
-    )
+    telegram_id = update.effective_user.id
+    saved = await get_saved_open_url(telegram_id)
+
+    if saved:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Use saved open URL",
+                        callback_data="use_saved_open",
+                    )
+                ],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+            ]
+        )
+        await send_or_edit(
+            update,
+            "🔗 <b>Step 1/2 — Open Link URL</b>\n\n"
+            f"You have a saved open URL:\n<code>{saved}</code>\n\n"
+            "Tap the button to reuse it, or send a new URL.",
+            reply_markup=keyboard,
+        )
+    else:
+        await send_or_edit(
+            update,
+            "🔗 <b>Step 1/2 — Open Link URL</b>\n\n"
+            "Send me the URL you want as the <b>Open Link</b> "
+            "(shown to visitors as Step 1).\n\n"
+            "<i>It will be saved for reuse next time.</i>",
+            reply_markup=cancel_keyboard(),
+        )
     return ASK_OPEN_URL
+
+
+async def use_saved_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    saved = await get_saved_open_url(telegram_id)
+    if not saved:
+        await update.callback_query.answer("No saved open URL found.", show_alert=True)
+        await update.callback_query.edit_message_text(
+            "🔗 <b>Step 1/2 — Open Link URL</b>\n\n"
+            "No saved open URL. Please send one now.",
+            reply_markup=cancel_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return ASK_OPEN_URL
+
+    context.user_data["open_url"] = saved
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "🔓 <b>Step 2/2 — Unlock Link URL</b>\n\n"
+        f"Open URL (saved): <code>{saved}</code>\n\n"
+        "Now send me the <b>Unlock Link</b> URL "
+        "(revealed after visitors complete the steps).",
+        reply_markup=cancel_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+    return ASK_UNLOCK_URL
 
 
 async def receive_open_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -321,87 +380,14 @@ async def receive_open_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ASK_OPEN_URL
 
     context.user_data["open_url"] = text
-    telegram_id = update.effective_user.id
-    saved = await get_saved_unlock_url(telegram_id)
-
-    if saved:
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ Use saved unlock URL",
-                        callback_data="use_saved_unlock",
-                    )
-                ],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
-            ]
-        )
-        await update.message.reply_text(
-            "🔓 <b>Step 2/2 — Unlock Link URL</b>\n\n"
-            f"You have a saved unlock URL:\n<code>{saved}</code>\n\n"
-            "Tap the button to reuse it, or send a new URL.",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await update.message.reply_text(
-            "🔓 <b>Step 2/2 — Unlock Link URL</b>\n\n"
-            "Now send me the URL you want as the <b>Unlock Link</b> "
-            "(revealed to visitors after they complete the steps).\n\n"
-            "<i>It will be saved for reuse next time.</i>",
-            reply_markup=cancel_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-    return ASK_UNLOCK_URL
-
-
-async def _finish_create(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    unlock_url: str,
-) -> int:
-    """Shared logic: create link, save unlock URL as preference, reply success."""
-    open_url = context.user_data.get("open_url", "")
-    telegram_id = update.effective_user.id
-
-    link_id = await create_link(telegram_id, open_url, unlock_url)
-    await set_saved_unlock_url(telegram_id, unlock_url)
-    generated_url = f"{FRONTEND_BASE_URL}/?id={link_id}"
-    context.user_data.clear()
-
-    text = (
-        f"✅ <b>Link created!</b>\n\n"
-        f"<b>ID:</b> {link_id}\n"
-        f"<b>Open URL:</b> <code>{open_url}</code>\n"
-        f"<b>Unlock URL:</b> <code>{unlock_url}</code>\n\n"
-        f"<b>Your link:</b>\n{generated_url}\n\n"
-        f"<i>Unlock URL saved for next time.</i>"
+    await update.message.reply_text(
+        "🔓 <b>Step 2/2 — Unlock Link URL</b>\n\n"
+        "Now send me the URL you want as the <b>Unlock Link</b> "
+        "(revealed to visitors after they complete the steps).",
+        reply_markup=cancel_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        try:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=after_create_keyboard(),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            await update.effective_chat.send_message(
-                text,
-                reply_markup=after_create_keyboard(),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=after_create_keyboard(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    return ConversationHandler.END
+    return ASK_UNLOCK_URL
 
 
 async def receive_unlock_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -414,23 +400,27 @@ async def receive_unlock_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return ASK_UNLOCK_URL
 
-    return await _finish_create(update, context, text)
-
-
-async def use_saved_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    open_url = context.user_data.get("open_url", "")
+    unlock_url = text
     telegram_id = update.effective_user.id
-    saved = await get_saved_unlock_url(telegram_id)
-    if not saved:
-        await update.callback_query.answer("No saved unlock URL found.", show_alert=True)
-        await update.callback_query.edit_message_text(
-            "🔓 <b>Step 2/2 — Unlock Link URL</b>\n\n"
-            "No saved unlock URL. Please send one now.",
-            reply_markup=cancel_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return ASK_UNLOCK_URL
 
-    return await _finish_create(update, context, saved)
+    link_id = await create_link(telegram_id, open_url, unlock_url)
+    await set_saved_open_url(telegram_id, open_url)
+    generated_url = f"{FRONTEND_BASE_URL}/?id={link_id}"
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"✅ <b>Link created!</b>\n\n"
+        f"<b>ID:</b> {link_id}\n"
+        f"<b>Open URL:</b> <code>{open_url}</code>\n"
+        f"<b>Unlock URL:</b> <code>{unlock_url}</code>\n\n"
+        f"<b>Your link:</b>\n{generated_url}\n\n"
+        f"<i>Open URL saved for next time.</i>",
+        reply_markup=after_create_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    return ConversationHandler.END
 
 
 async def cancel_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -567,13 +557,13 @@ async def edit_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     telegram_id = update.effective_user.id
 
     success = await update_link(link_id, telegram_id, field, text)
-    if success and field == "unlock_url":
-        await set_saved_unlock_url(telegram_id, text)
+    if success and field == "open_url":
+        await set_saved_open_url(telegram_id, text)
     context.user_data.clear()
 
     if success:
         label = "Open URL" if field == "open_url" else "Unlock URL"
-        extra = "\n\n<i>Unlock URL also saved for reuse.</i>" if field == "unlock_url" else ""
+        extra = "\n\n<i>Open URL also saved for reuse.</i>" if field == "open_url" else ""
         await update.message.reply_text(
             f"✅ <b>Updated!</b>\n\n"
             f"Link ID <b>{link_id}</b>\n"
@@ -602,11 +592,11 @@ def build_bot_application() -> Application:
         states={
             ASK_OPEN_URL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_open_url),
+                CallbackQueryHandler(use_saved_open, pattern="^use_saved_open$"),
                 CallbackQueryHandler(cancel_creation, pattern="^cancel$"),
             ],
             ASK_UNLOCK_URL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_unlock_url),
-                CallbackQueryHandler(use_saved_unlock, pattern="^use_saved_unlock$"),
                 CallbackQueryHandler(cancel_creation, pattern="^cancel$"),
             ],
         },
