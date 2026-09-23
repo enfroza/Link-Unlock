@@ -3,9 +3,8 @@ main.py — Link Unlock Bot & API
 ================================
 A single-file, lightweight FastAPI + python-telegram-bot (v20+) application.
 
-Runs a Telegram bot (button-driven link-creation flow) and a REST API
-(serves link configs to the hornyunlock.netlify.app frontend) concurrently
-in a single asyncio event loop.
+Runs a Telegram bot (button-driven link-creation + edit flow) and a REST API
+(serves link configs to the frontend) concurrently in a single asyncio event loop.
 
 Setup:
     pip install -r requirements.txt
@@ -51,7 +50,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)  # quiet PTB's internal HTTP client
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("link_unlock")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -69,8 +68,9 @@ if not BOT_TOKEN:
         "  export BOT_TOKEN='123456789:your-token-here'"
     )
 
-# Conversation states for the "Create New Link" flow
+# Conversation states
 ASK_OPEN_URL, ASK_UNLOCK_URL = range(2)
+EDIT_CHOOSE_LINK, EDIT_CHOOSE_FIELD, EDIT_NEW_VALUE = range(2, 5)
 
 # --------------------------------------------------------------------------
 # Database layer (aiosqlite)
@@ -119,6 +119,19 @@ async def get_links_for_user(telegram_id: int, limit: int = 10) -> list[aiosqlit
             (telegram_id, limit),
         ) as cur:
             return await cur.fetchall()
+
+
+async def update_link(link_id: int, telegram_id: int, field: str, value: str) -> bool:
+    """Update open_url or unlock_url. Returns True if a row was updated."""
+    if field not in ("open_url", "unlock_url"):
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"UPDATE links SET {field} = ? WHERE id = ? AND telegram_id = ?",
+            (value, link_id, telegram_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------
@@ -173,7 +186,7 @@ async def get_config(config_id: int) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Telegram bot — keyboards & small helpers
+# Telegram bot — keyboards & helpers
 # --------------------------------------------------------------------------
 
 
@@ -220,14 +233,14 @@ async def send_or_edit(
             )
             return
         except Exception:
-            pass  # message unchanged / too old to edit — fall back to sending a new one
+            pass
     await update.effective_chat.send_message(
         text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
     )
 
 
 # --------------------------------------------------------------------------
-# Telegram bot — handlers
+# Telegram bot — Create Link handlers
 # --------------------------------------------------------------------------
 
 
@@ -301,6 +314,8 @@ async def receive_unlock_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"✅ <b>Link created!</b>\n\n"
         f"<b>ID:</b> {link_id}\n"
+        f"<b>Open URL:</b> <code>{open_url}</code>\n"
+        f"<b>Unlock URL:</b> <code>{unlock_url}</code>\n\n"
         f"<b>Your link:</b>\n{generated_url}",
         reply_markup=after_create_keyboard(),
         parse_mode=ParseMode.HTML,
@@ -327,23 +342,139 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+# --------------------------------------------------------------------------
+# Telegram bot — My Links + Edit handlers
+# --------------------------------------------------------------------------
+
+
 async def show_my_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
     rows = await get_links_for_user(telegram_id, limit=10)
 
     if not rows:
         text = "📋 <b>My Links</b>\n\nYou haven't created any links yet."
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+        )
     else:
-        lines = ["📋 <b>Your Last 10 Links</b>"]
+        lines = ["📋 <b>Your Last 10 Links</b>\n"]
         for row in rows:
-            url = f"{FRONTEND_BASE_URL}/?id={row['id']}"
-            lines.append(f"\n<b>ID {row['id']}</b>\n{url}")
+            final_url = f"{FRONTEND_BASE_URL}/?id={row['id']}"
+            lines.append(
+                f"<b>ID {row['id']}</b>\n"
+                f"🔗 Open: <code>{row['open_url']}</code>\n"
+                f"🔓 Unlock: <code>{row['unlock_url']}</code>\n"
+                f"🌐 Page: {final_url}\n"
+            )
         text = "\n".join(lines)
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✏️ Edit a Link", callback_data="edit_link")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+            ]
+        )
+
+    await send_or_edit(update, text, reply_markup=keyboard)
+
+
+async def start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await send_or_edit(
+        update,
+        "✏️ <b>Edit Link</b>\n\nSend the <b>ID</b> of the link you want to edit:",
+        reply_markup=cancel_keyboard(),
+    )
+    return EDIT_CHOOSE_LINK
+
+
+async def edit_choose_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text(
+            "⚠️ Please send a valid numeric ID.",
+            reply_markup=cancel_keyboard(),
+        )
+        return EDIT_CHOOSE_LINK
+
+    link_id = int(text)
+    row = await get_link(link_id)
+    if row is None or row["telegram_id"] != update.effective_user.id:
+        await update.message.reply_text(
+            "⚠️ Link not found or you don't own it.",
+            reply_markup=cancel_keyboard(),
+        )
+        return EDIT_CHOOSE_LINK
+
+    context.user_data["edit_link_id"] = link_id
 
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+        [
+            [InlineKeyboardButton("🔗 Change Open URL", callback_data="edit_open")],
+            [InlineKeyboardButton("🔓 Change Unlock URL", callback_data="edit_unlock")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        ]
     )
-    await send_or_edit(update, text, reply_markup=keyboard)
+    await update.message.reply_text(
+        f"Editing <b>ID {link_id}</b>\n\n"
+        f"Current Open: <code>{row['open_url']}</code>\n"
+        f"Current Unlock: <code>{row['unlock_url']}</code>\n\n"
+        "What do you want to change?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    return EDIT_CHOOSE_FIELD
+
+
+async def edit_choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "edit_open":
+        context.user_data["edit_field"] = "open_url"
+        field_name = "Open URL"
+    else:
+        context.user_data["edit_field"] = "unlock_url"
+        field_name = "Unlock URL"
+
+    await query.edit_message_text(
+        f"Send the new <b>{field_name}</b>:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_keyboard(),
+    )
+    return EDIT_NEW_VALUE
+
+
+async def edit_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not is_valid_url(text):
+        await update.message.reply_text(
+            "⚠️ Invalid URL. It must start with http:// or https://",
+            reply_markup=cancel_keyboard(),
+        )
+        return EDIT_NEW_VALUE
+
+    link_id = context.user_data.get("edit_link_id")
+    field = context.user_data.get("edit_field")
+    telegram_id = update.effective_user.id
+
+    success = await update_link(link_id, telegram_id, field, text)
+    context.user_data.clear()
+
+    if success:
+        label = "Open URL" if field == "open_url" else "Unlock URL"
+        await update.message.reply_text(
+            f"✅ <b>Updated!</b>\n\n"
+            f"Link ID <b>{link_id}</b>\n"
+            f"{label}: <code>{text}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ Failed to update. Link not found.",
+            reply_markup=main_menu_keyboard(),
+        )
+    return ConversationHandler.END
 
 
 # --------------------------------------------------------------------------
@@ -354,7 +485,7 @@ async def show_my_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_bot_application() -> Application:
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    create_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_create, pattern="^create_new$")],
         states={
             ASK_OPEN_URL: [
@@ -372,11 +503,39 @@ def build_bot_application() -> Application:
             CommandHandler("start", start_command),
         ],
         name="create_link_conversation",
-        allow_reentry=True,  # lets user press "Create New Link" again while already in a flow
+        allow_reentry=True,
+        per_message=False,
+    )
+
+    edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_edit, pattern="^edit_link$")],
+        states={
+            EDIT_CHOOSE_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_choose_link),
+                CallbackQueryHandler(cancel_creation, pattern="^cancel$"),
+            ],
+            EDIT_CHOOSE_FIELD: [
+                CallbackQueryHandler(edit_choose_field, pattern="^edit_(open|unlock)$"),
+                CallbackQueryHandler(cancel_creation, pattern="^cancel$"),
+            ],
+            EDIT_NEW_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_new_value),
+                CallbackQueryHandler(cancel_creation, pattern="^cancel$"),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_creation, pattern="^cancel$"),
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("start", start_command),
+        ],
+        name="edit_link_conversation",
+        allow_reentry=True,
+        per_message=False,
     )
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(conv_handler)
+    application.add_handler(create_conv)
+    application.add_handler(edit_conv)
     application.add_handler(CallbackQueryHandler(show_my_links, pattern="^my_links$"))
     application.add_handler(CallbackQueryHandler(show_main_menu, pattern="^main_menu$"))
 
@@ -384,7 +543,7 @@ def build_bot_application() -> Application:
 
 
 # --------------------------------------------------------------------------
-# Entrypoint — run FastAPI (uvicorn) and the Telegram bot concurrently
+# Entrypoint — run FastAPI + Telegram bot concurrently
 # --------------------------------------------------------------------------
 
 
